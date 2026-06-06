@@ -1,10 +1,10 @@
 /* ============================================================
  * lonely_radar — LiDAR sweep + servo + mood buzzer
- * Target: Arduino Uno R4 (WiFi or Minima)
+ * Target: Arduino Uno R4 (Minima or WiFi)
  *
  * Hardware wiring
  * ---------------
- * LIDAR-Lite v3 (same as pet_lidar):
+ * LIDAR-Lite v3:
  *   Pin 1 (Power)        -> 5V
  *   Pin 2 (GND)          -> GND
  *   Pin 3 (Mode control) -> unconnected
@@ -17,140 +17,160 @@
  *   Power                -> 5V
  *   GND                  -> GND
  *
- * Passive buzzer (or small speaker with series resistor ~100 Ω):
- *   Positive leg         -> D8
- *   Other leg            -> GND
+ * Passive buzzer:
+ *   (+) leg              -> D8
+ *   (−) leg              -> GND
  * ============================================================ */
 
+#include <Arduino.h>
 #include <Wire.h>
 #include <Servo.h>
 #include "LidarLiteV3.h"
 
 /* ---- Pin assignments ---- */
-#define SERVO_PIN    9
-#define SPEAKER_PIN  8
+#define SERVO_PIN        9
+#define SPEAKER_PIN      8
 
 /* ---- Sweep parameters ---- */
-#define SWEEP_STEP_DEG   2    /* degrees per step                  */
-#define SWEEP_STEP_MS   10    /* delay between steps (ms)          */
-#define SERVO_MIN_DEG    0
-#define SERVO_MAX_DEG  180
+#define SWEEP_MIN_DEG    45    /* 90° window centred on straight-ahead */
+#define SWEEP_MAX_DEG    135
+#define SWEEP_STEP_DEG   2
+#define STEP_DELAY_MS    12    /* time between servo steps (ms) */
 
-/* ---- Mood distance thresholds (cm) ---- */
-#define ZONE_CLOSE_CM   80   /* ≤ 80 cm  → EXCITED  */
-#define ZONE_NEAR_CM   150   /* ≤ 150 cm → HAPPY    */
-#define ZONE_FAR_CM    250   /* ≤ 250 cm → HOPEFUL  */
-                             /* > 250 cm → LONELY   */
+/* ---- Distance thresholds (cm) — 0 is ignored (sensor error) ---- */
+#define DIST_CLOSE_CM    60
+#define DIST_NEAR_CM     120
+#define DIST_FAR_CM      200
+#define DIST_MAX_CM      300   /* treat anything >= this as "nobody" */
 
-/* ---- Note frequencies (Hz) ---- */
-#define NOTE_D4   294
-#define NOTE_E4   330
-#define NOTE_G4   392
-#define NOTE_A4   440
-#define NOTE_C5   523
-#define NOTE_E5   659
-#define NOTE_G5   784
-#define NOTE_C6  1047
+/* ---- Tone gap between notes ---- */
+#define GAP_MS           40
 
-/* ---- Mood identifiers ---- */
+/* ============================================================
+ * Mood identifiers
+ * ============================================================ */
 #define MOOD_LONELY   0
-#define MOOD_HOPEFUL  1
-#define MOOD_HAPPY    2
-#define MOOD_EXCITED  3
-
-/* ---- Objects ---- */
-LidarLiteV3 lidar;
-Servo       servo;
-
-/* ---- State ---- */
-static int  currentMood = MOOD_LONELY;
+#define MOOD_SAD      1
+#define MOOD_HOPEFUL  2
+#define MOOD_HAPPY    3
+#define MOOD_EXCITED  4
+#define MOOD_COUNT    5
 
 /* ============================================================
- * Helper: play one note then wait (blocking, acceptable for
- * hackathon use — keeps the sketch simple and self-contained).
+ * Note tables
+ * Each entry: { freq_hz, dur_ms }  — freq == 0 means REST
+ *
+ * On ARM (Renesas RA4M1) const data already lives in flash;
+ * no PROGMEM / pgm_read_* machinery is needed or used.
  * ============================================================ */
-static void playNote(unsigned int freq, unsigned int durationMs, unsigned int gapMs)
-{
-    tone(SPEAKER_PIN, freq, durationMs);
-    delay(durationMs + gapMs);
-}
+struct Note {
+    uint16_t freq;
+    uint16_t dur_ms;
+};
+
+/* LONELY — slow, low, minor, descending, mournful */
+static const Note lonelyNotes[] = {
+    { 220, 600 },   /* A3 */
+    { 196, 600 },   /* G3 */
+    { 165, 700 },   /* E3 */
+    {   0, 400 },   /* REST */
+};
+
+/* SAD — slow minor, slight movement */
+static const Note sadNotes[] = {
+    { 220, 500 },   /* A3 */
+    { 247, 400 },   /* B3 */
+    { 196, 500 },   /* G3 */
+    {   0, 300 },   /* REST */
+};
+
+/* HOPEFUL — moderate, minor→major hint */
+static const Note hopefulNotes[] = {
+    { 294, 350 },   /* D4 */
+    { 330, 300 },   /* E4 */
+    { 392, 350 },   /* G4 */
+    { 440, 300 },   /* A4 */
+};
+
+/* HAPPY — upbeat major */
+static const Note happyNotes[] = {
+    {  523, 200 },  /* C5 */
+    {  659, 180 },  /* E5 */
+    {  784, 200 },  /* G5 */
+    { 1047, 250 },  /* C6 */
+};
+
+/* EXCITED — fast, high, major arpeggio */
+static const Note excitedNotes[] = {
+    {  523, 100 },  /* C5 */
+    {  659,  90 },  /* E5 */
+    {  784,  90 },  /* G5 */
+    { 1047, 100 },  /* C6 */
+    {  784,  90 },  /* G5 */
+    {  659,  90 },  /* E5 */
+};
+
+/* Dispatch table — indexed by MOOD_* */
+static const Note * const moodTables[MOOD_COUNT] = {
+    lonelyNotes,
+    sadNotes,
+    hopefulNotes,
+    happyNotes,
+    excitedNotes,
+};
+
+static const uint8_t moodTableSizes[MOOD_COUNT] = {
+    4,  /* LONELY  */
+    4,  /* SAD     */
+    4,  /* HOPEFUL */
+    4,  /* HAPPY   */
+    6,  /* EXCITED */
+};
 
 /* ============================================================
- * Mood phrases — each is a short blocking musical sequence.
+ * Objects
  * ============================================================ */
-static void playLonely(void)
-{
-    /* Slow, minor-key, descending — played twice */
-    for (uint8_t rep = 0; rep < 2; rep++) {
-        playNote(NOTE_A4, 500, 100);
-        playNote(NOTE_G4, 500, 100);
-        playNote(NOTE_E4, 500, 100);
-        playNote(NOTE_D4, 500, 100);
-    }
-}
-
-static void playHopeful(void)
-{
-    /* Slightly faster, minor but rising at the end — played once */
-    playNote(NOTE_D4, 350, 80);
-    playNote(NOTE_E4, 350, 80);
-    playNote(NOTE_G4, 350, 80);
-    playNote(NOTE_A4, 350, 80);
-}
-
-static void playHappy(void)
-{
-    /* Upbeat major arpeggio — played once */
-    playNote(NOTE_C5, 200, 60);
-    playNote(NOTE_E5, 200, 60);
-    playNote(NOTE_G5, 200, 60);
-    playNote(NOTE_C6, 200, 60);
-}
-
-static void playExcited(void)
-{
-    /* Fast, high, major arpeggio up and back — played once */
-    playNote(NOTE_C5, 100, 30);
-    playNote(NOTE_E5, 100, 30);
-    playNote(NOTE_G5, 100, 30);
-    playNote(NOTE_C6, 100, 30);
-    playNote(NOTE_G5, 100, 30);
-    playNote(NOTE_E5, 100, 30);
-    playNote(NOTE_C5, 100, 30);
-}
+static LidarLiteV3 lidar;
+static Servo        servo;
 
 /* ============================================================
- * Dispatch to the correct phrase for the current mood.
+ * State variables — all static/global, no heap allocation
  * ============================================================ */
-static void playMood(int mood)
-{
-    switch (mood) {
-        case MOOD_LONELY:  playLonely();  break;
-        case MOOD_HOPEFUL: playHopeful(); break;
-        case MOOD_HAPPY:   playHappy();   break;
-        case MOOD_EXCITED: playExcited(); break;
-        default:           break;
-    }
-}
+
+/* Servo sweep */
+static int      servoAngle  = SWEEP_MIN_DEG;
+static int      servoDir    = +SWEEP_STEP_DEG;  /* flips at limits */
+static uint32_t lastStepMs  = 0;
+
+/* LiDAR — rolling minimum over the last full sweep */
+static uint16_t closestCm   = DIST_MAX_CM;  /* best valid reading this sweep */
+static uint16_t displayCm   = DIST_MAX_CM;  /* committed after each full sweep */
+
+/* Tone sequencer */
+static uint8_t  noteIndex   = 0;
+static uint32_t noteEndMs   = 0;
+static int      activeMood  = MOOD_LONELY;  /* mood currently playing */
 
 /* ============================================================
- * Map a minimum distance to a mood.
+ * Helper: map displayCm to a mood
  * ============================================================ */
-static int distanceToMood(uint16_t minCm)
+static int distanceToMood(uint16_t cm)
 {
-    if (minCm <= ZONE_CLOSE_CM) return MOOD_EXCITED;
-    if (minCm <= ZONE_NEAR_CM)  return MOOD_HAPPY;
-    if (minCm <= ZONE_FAR_CM)   return MOOD_HOPEFUL;
-    return MOOD_LONELY;
+    if (cm >= DIST_MAX_CM)   return MOOD_LONELY;
+    if (cm >= DIST_FAR_CM)   return MOOD_SAD;
+    if (cm >= DIST_NEAR_CM)  return MOOD_HOPEFUL;
+    if (cm >= DIST_CLOSE_CM) return MOOD_HAPPY;
+    return MOOD_EXCITED;
 }
 
 /* ============================================================
- * Return a human-readable mood label.
+ * Helper: human-readable mood label
  * ============================================================ */
 static const char *moodLabel(int mood)
 {
     switch (mood) {
         case MOOD_LONELY:  return "LONELY";
+        case MOOD_SAD:     return "SAD";
         case MOOD_HOPEFUL: return "HOPEFUL";
         case MOOD_HAPPY:   return "HAPPY";
         case MOOD_EXCITED: return "EXCITED";
@@ -159,88 +179,106 @@ static const char *moodLabel(int mood)
 }
 
 /* ============================================================
- * Perform one sweep (0→180 or 180→0), updating minDist_cm.
- * Returns true if at least one valid reading was obtained.
- * ============================================================ */
-static bool doSweep(int fromDeg, int toDeg, uint16_t &minDist_cm)
-{
-    bool gotReading = false;
-    int  step = (toDeg > fromDeg) ? SWEEP_STEP_DEG : -SWEEP_STEP_DEG;
-
-    for (int angle = fromDeg; ; angle += step) {
-        /* Clamp to endpoint so we always land exactly on it */
-        if (step > 0 && angle > toDeg) angle = toDeg;
-        if (step < 0 && angle < toDeg) angle = toDeg;
-
-        servo.write(angle);
-        delay(SWEEP_STEP_MS);
-
-        /* Fire a LiDAR reading; skip silently on error */
-        uint16_t dist;
-        if (lidar.readDistance(dist)) {
-            if (!gotReading || dist < minDist_cm) {
-                minDist_cm = dist;
-            }
-            gotReading = true;
-        }
-
-        if (angle == toDeg) break;
-    }
-
-    return gotReading;
-}
-
-/* ============================================================
  * setup
  * ============================================================ */
 void setup()
 {
     Serial.begin(115200);
-    while (!Serial);   /* wait for USB CDC on R4 */
+    while (!Serial) {}   /* wait for USB CDC on R4 */
 
-    Serial.println("lonely_radar — starting up");
+    Serial.println(F("lonely_radar — starting up"));
 
-    /* Attach servo and park at 0° */
     servo.attach(SERVO_PIN);
-    servo.write(SERVO_MIN_DEG);
-    delay(500);
+    servo.write(SWEEP_MIN_DEG);
 
-    /* Initialise LiDAR */
     if (!lidar.begin()) {
-        Serial.println("ERROR: LIDAR not found (I2C 0x62). Check wiring.");
+        Serial.println(F("ERROR: LIDAR not found (I2C 0x62). Check wiring."));
         while (1) {}
     }
-    Serial.println("LIDAR ready — beginning sweep");
+    Serial.println(F("LIDAR ready — beginning sweep"));
+
+    lastStepMs = millis();
+    noteEndMs  = millis();  /* fire first note immediately */
 }
 
 /* ============================================================
- * loop — one full back-and-forth sweep per iteration
+ * loop — non-blocking state machine, no delay() calls
  * ============================================================ */
 void loop()
 {
-    uint16_t minDist_cm = 0;
-    bool     gotAny     = false;
+    uint32_t now = millis();
 
-    /* Forward sweep: 0° → 180° */
-    bool fwd = doSweep(SERVO_MIN_DEG, SERVO_MAX_DEG, minDist_cm);
-    gotAny = fwd;
+    /* ----------------------------------------------------------
+     * Servo + LiDAR update — runs every STEP_DELAY_MS
+     * ---------------------------------------------------------- */
+    if (now - lastStepMs >= (uint32_t)STEP_DELAY_MS) {
+        lastStepMs = now;
 
-    /* Reverse sweep: 180° → 0°, continuing to track minimum */
-    bool rev = doSweep(SERVO_MAX_DEG, SERVO_MIN_DEG, minDist_cm);
-    gotAny = gotAny || rev;
+        /* Move servo to current angle */
+        servo.write(servoAngle);
 
-    /* Update mood only if we got at least one valid reading */
-    if (gotAny) {
-        currentMood = distanceToMood(minDist_cm);
+        /* Fire LiDAR reading; distance=0 is silently ignored */
+        uint16_t cm = 0;
+        bool ok = lidar.readDistance(cm);
+        if (ok && cm > 0) {
+            if (cm < closestCm) {
+                closestCm = cm;
+            }
+        }
+
+        /* Check for sweep limit — commit displayCm and flip direction */
+        if (servoAngle <= SWEEP_MIN_DEG || servoAngle >= SWEEP_MAX_DEG) {
+            displayCm = closestCm;
+            closestCm = DIST_MAX_CM;
+
+            /* Print one line per half-sweep */
+            int mood = distanceToMood(displayCm);
+            Serial.print('[');
+            Serial.print(moodLabel(mood));
+            Serial.print(F("] Closest: "));
+            Serial.print(displayCm);
+            Serial.println(F(" cm"));
+
+            /* Flip sweep direction */
+            servoDir = -servoDir;
+        }
+
+        /* Advance angle for next step, clamped to sweep window */
+        servoAngle += servoDir;
+        if (servoAngle < SWEEP_MIN_DEG) servoAngle = SWEEP_MIN_DEG;
+        if (servoAngle > SWEEP_MAX_DEG) servoAngle = SWEEP_MAX_DEG;
     }
 
-    /* Print one line per sweep */
-    Serial.print("[");
-    Serial.print(moodLabel(currentMood));
-    Serial.print("] Closest: ");
-    Serial.print(gotAny ? minDist_cm : 0);
-    Serial.println(" cm");
+    /* ----------------------------------------------------------
+     * Tone sequencer — non-blocking, runs every loop iteration
+     * ---------------------------------------------------------- */
+    if (now >= noteEndMs) {
+        /* Determine current mood from displayCm */
+        int newMood = distanceToMood(displayCm);
 
-    /* Play the mood phrase between sweeps */
-    playMood(currentMood);
+        /* Mood change: restart phrase from the beginning */
+        if (newMood != activeMood) {
+            activeMood = newMood;
+            noteIndex  = 0;
+        }
+
+        /* Look up current note */
+        const Note *table  = moodTables[activeMood];
+        uint8_t     size   = moodTableSizes[activeMood];
+        uint16_t    freq   = table[noteIndex].freq;
+        uint16_t    dur_ms = table[noteIndex].dur_ms;
+
+        /* Play note or rest */
+        if (freq == 0) {
+            noTone(SPEAKER_PIN);
+        } else {
+            tone(SPEAKER_PIN, freq, dur_ms);
+        }
+
+        /* Schedule next note boundary */
+        noteEndMs = now + (uint32_t)dur_ms + (uint32_t)GAP_MS;
+
+        /* Advance note index, wrapping around the table */
+        noteIndex = (noteIndex + 1) % size;
+    }
 }
