@@ -1,3 +1,12 @@
+/* LIDAR-Lite v3 wiring (Arduino Uno R4):
+ *   Pin 1 (Power)        -> 5V
+ *   Pin 2 (GND)          -> GND
+ *   Pin 3 (Mode control) -> unconnected
+ *   Pin 4 (SCL)          -> SCL
+ *   Pin 5 (SDA)          -> SDA
+ *   Pin 6 (Power enable) -> 5V
+ */
+
 #include <Wire.h>
 #include "LidarLiteV3.h"
 
